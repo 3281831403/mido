@@ -29,6 +29,15 @@ messages and meta messages, with the ``time`` attribute of each
 messages set to its delta time (in ticks). (See Tempo and Beat
 Resolution below for more on delta times.)
 
+RIFF/RMID containers
+^^^^^^^^^^^^^^^^^^^^
+
+MIDI files can be wrapped in a RIFF container with the ``RMID`` form
+type, for example when they are embedded in other media files. These
+files are unwrapped transparently on reading; chunks that precede the
+``data`` chunk, such as a ``LIST/INFO`` chunk, are skipped. As with
+unwrapped files, ``save()`` writes a plain standard MIDI file.
+
 To print out all messages in the file, you can do::
 
     for i, track in enumerate(mid.tracks):
@@ -174,6 +183,16 @@ For a list of supported meta messages and their attributes, and also
 how to implement new meta messages, see :doc:`../meta_message_types`.
 
 
+Escape Events
+-------------
+
+A track can contain escape events, which start with the ``F7`` status byte.
+Unlike a ``sysex`` message, the payload of an escape event is arbitrary and
+may contain any byte from 0 to 255. Escape events are read as
+``SysexEscapeMessage`` objects, whose ``data`` attribute holds the payload as
+raw bytes, and are written back with the same ``F7`` status byte and payload.
+
+
 About the Time Attribute
 ------------------------
 
@@ -206,6 +225,15 @@ resolution is stored as ``ticks_per_beat`` in MidiFile objects.
 
 The meaning of this ``ticks_per_beat`` in terms of absolute timing depends on
 the tempo and time signature of the file.
+
+SMF also supports a second, time code based time division (SMPTE). In those
+files the division word is negative: the high byte holds a negative frame
+rate code (``-24``, ``-25``, ``-29`` for 29.97 fps or ``-30``) and the low
+byte the number of ticks per frame. For such files ``ticks_per_beat`` is
+``None`` and the frame rate and tick resolution are available as
+``frames_per_second`` and ``ticks_per_frame``. The duration of a tick is fixed
+(``1 / (frames_per_second * ticks_per_frame)`` seconds) and the tempo map
+does not affect it.
 
 
 MIDI Tempo vs. BPM

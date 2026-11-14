@@ -19,12 +19,13 @@ http://www.recordingblogs.com/sa/tabid/82/EntryId/44/MIDI-Part-XIII-Delta-time-a
 http://www.sonicspot.com/guide/midifiles.html
 """
 
+import io
 import string
 import struct
 import time
 from numbers import Integral
 
-from ..messages import SPEC_BY_STATUS, Message
+from ..messages import SPEC_BY_STATUS, BaseMessage, Message
 from .meta import MetaMessage, build_meta_message, encode_variable_int, meta_charset
 from .tracks import MidiTrack, fix_end_of_track, merge_tracks
 from .units import tick2second
@@ -36,6 +37,190 @@ DEFAULT_TICKS_PER_BEAT = 480
 
 # Maximum message length to attempt to read.
 MAX_MESSAGE_LENGTH = 1000000
+
+# The division word is a signed 16 bit value. Negative values select
+# SMPTE time code: the high byte holds the (negative) frame rate code
+# and the low byte the number of ticks per frame.
+SMPTE_FPS_BY_CODE = {-24: 24, -25: 25, -29: 29.97, -30: 30}
+SMPTE_CODE_BY_FPS = {fps: code for code, fps in SMPTE_FPS_BY_CODE.items()}
+
+
+def decode_division(division):
+    """Decode a header division word.
+
+    Returns (ticks_per_beat, frames_per_second, ticks_per_frame).
+    For metrical (PPQN) files the last two values are None.
+
+    The division word can be given as a signed 16 bit value (as read
+    from the file header) or as its raw unsigned 16 bit representation.
+    """
+    if division > 0x7fff:
+        division = struct.unpack('h', struct.pack('H', division & 0xffff))[0]
+
+    if division >= 0:
+        return division, None, None
+
+    # For a valid negative division the two bytes are a negative frame
+    # rate code and a non-zero ticks per frame value. Anything else
+    # (including a positive high byte, which cannot occur in a valid
+    # SMPTE division) is rejected.
+    if (division >> 8) & 0x80 == 0:
+        raise ValueError('invalid SMPTE division word')
+
+    ticks_per_frame = division & 0xff
+    code = struct.unpack('b', bytes([(division >> 8) & 0xff]))[0]
+
+    if code not in SMPTE_FPS_BY_CODE:
+        raise ValueError(f'unsupported SMPTE frame rate code {code}')
+    if ticks_per_frame == 0:
+        raise ValueError('SMPTE ticks per frame must be non-zero')
+
+    return None, SMPTE_FPS_BY_CODE[code], ticks_per_frame
+
+
+def encode_division(frames_per_second, ticks_per_frame):
+    """Encode an SMPTE division as a signed 16 bit value."""
+    if frames_per_second not in SMPTE_CODE_BY_FPS:
+        raise ValueError(
+            f'unsupported frames per second {frames_per_second!r}')
+    if not isinstance(ticks_per_frame, Integral) or not 1 <= ticks_per_frame <= 255:
+        raise ValueError('ticks per frame must be in range 1..255')
+
+    return ((SMPTE_CODE_BY_FPS[frames_per_second] & 0xff) << 8) | ticks_per_frame
+
+
+class SysexEscapeMessage(BaseMessage):
+    """A MIDI file escape event (0xF7).
+
+    Unlike a sysex message, the payload of an escape event is arbitrary
+    and may contain bytes in the range 0..255, so it is kept as raw
+    bytes and written back unchanged.
+    """
+    is_meta = False
+    type = 'sysex_escape'
+
+    def __init__(self, data=(), time=0, skip_checks=False):
+        if not skip_checks:
+            _check_escape_data(data)
+
+        vars(self).update({'type': self.type,
+                           'data': tuple(data),
+                           'time': time})
+
+    def copy(self, skip_checks=False, **overrides):
+        if not overrides:
+            # Bypass all checks.
+            msg = self.__class__.__new__(self.__class__)
+            vars(msg).update(vars(self))
+            return msg
+
+        if 'type' in overrides and overrides['type'] != self.type:
+            raise ValueError('copy must be same message type')
+
+        attrs = vars(self).copy()
+        attrs.update(overrides)
+        attrs.pop('type', None)
+
+        return self.__class__(skip_checks=skip_checks, **attrs)
+
+    def bytes(self):
+        return [0xf7] + list(self.data)
+
+    def __repr__(self):
+        return (f'{self.__class__.__name__}'
+                f'(data={tuple(self.data)!r}, time={self.time!r})')
+
+
+def _check_escape_data(data):
+    for byte in data:
+        if not isinstance(byte, Integral):
+            raise TypeError('escape message data byte must be int')
+        elif not 0 <= byte <= 255:
+            raise ValueError(
+                'escape message data byte must be in range 0..255')
+
+
+class _PrefixedFile:
+    """A file wrapper that returns already read bytes before the rest.
+
+    This is used to peek at the first bytes of a stream without losing
+    them, so that plain MIDI files can still be read incrementally.
+    """
+    def __init__(self, prefix, file):
+        self._prefix = prefix
+        self._file = file
+
+    def read(self, size=-1):
+        if not self._prefix:
+            return self._file.read(size)
+
+        if size is None or size < 0:
+            data = self._prefix + self._file.read()
+            self._prefix = b''
+            return data
+
+        data = self._prefix[:size]
+        self._prefix = self._prefix[len(data):]
+
+        if len(data) < size:
+            data += self._file.read(size - len(data))
+
+        return data
+
+    def tell(self):
+        try:
+            position = self._file.tell()
+        except AttributeError:
+            raise io.UnsupportedOperation(
+                'underlying stream does not support tell()') from None
+
+        return position - len(self._prefix)
+
+
+def _unwrap_riff(infile):
+    """Return a stream positioned at a standard MIDI file header.
+
+    Files wrapped in a RIFF/RMID container are unwrapped by locating the
+    data chunk, which holds a complete standard MIDI file. Other input
+    is returned unchanged.
+    """
+    magic = infile.read(4)
+    if magic != b'RIFF':
+        return _PrefixedFile(magic, infile)
+
+    payload = infile.read()
+    stream = io.BytesIO(payload)
+
+    size_data = stream.read(4)
+    if len(size_data) < 4:
+        raise EOFError
+    size = struct.unpack('<L', size_data)[0]
+
+    if stream.read(4) != b'RMID':
+        raise OSError('RIFF file is not an RMID file')
+
+    riff_end = stream.tell() + size - 4
+    # Be lenient about a wrong RIFF size field.
+    riff_end = min(riff_end, 4 + len(payload))
+
+    while stream.tell() < riff_end:
+        chunk_id = stream.read(4)
+        if len(chunk_id) < 4:
+            break
+        chunk_size_data = stream.read(4)
+        if len(chunk_size_data) < 4:
+            break
+        chunk_size = struct.unpack('<L', chunk_size_data)[0]
+
+        if chunk_id == b'data':
+            return io.BytesIO(stream.read(chunk_size))
+
+        stream.read(chunk_size)
+        if chunk_size % 2:
+            # RIFF chunks are word aligned.
+            stream.read(1)
+
+    raise OSError('RMID file without a data chunk')
 
 
 def print_byte(byte, pos=0):
@@ -203,17 +388,21 @@ def read_track(infile, debug=False, clip=False):
             peek_data = [status_byte]
             status_byte = last_status
         else:
-            if status_byte != 0xff:
-                # Meta messages don't set running status.
+            if status_byte < 0xf0:
+                # Channel messages set running status. Meta, sysex and
+                # the other system messages cancel it.
                 last_status = status_byte
             peek_data = []
 
         if status_byte == 0xff:
             msg = read_meta_message(infile, delta)
-        elif status_byte in [0xf0, 0xf7]:
-            # TODO: I'm not quite clear on the difference between
-            # f0 and f7 events.
+        elif status_byte == 0xf0:
             msg = read_sysex(infile, delta, clip)
+        elif status_byte == 0xf7:
+            # An escape event. Unlike sysex its payload is arbitrary and
+            # is kept as raw bytes so it can be written back unchanged.
+            length = read_variable_int(infile)
+            msg = SysexEscapeMessage(read_bytes(infile, length), time=delta)
         else:
             msg = read_message(infile, status_byte, peek_data, delta, clip)
 
@@ -252,6 +441,13 @@ def write_track(outfile, track):
 
         if msg.is_meta:
             data.extend(msg.bytes())
+            running_status_byte = None
+        elif isinstance(msg, SysexEscapeMessage):
+            # Escape events keep their 0xF7 status byte and raw payload.
+            _check_escape_data(msg.data)
+            data.append(0xf7)
+            data.extend(encode_variable_int(len(msg.data)))
+            data.extend(msg.data)
             running_status_byte = None
         elif msg.type == 'sysex':
             data.append(0xf0)
@@ -300,6 +496,8 @@ class MidiFile:
         self.filename = filename
         self.type = type
         self.ticks_per_beat = ticks_per_beat
+        self.frames_per_second = None
+        self.ticks_per_frame = None
         self.charset = charset
         self.debug = debug
         self.clip = clip
@@ -348,6 +546,8 @@ class MidiFile:
         return track
 
     def _load(self, infile):
+        infile = _unwrap_riff(infile)
+
         if self.debug:
             infile = DebugFileWrapper(infile)
 
@@ -357,7 +557,11 @@ class MidiFile:
 
             (self.type,
              num_tracks,
-             self.ticks_per_beat) = read_file_header(infile)
+             division) = read_file_header(infile)
+
+            (self.ticks_per_beat,
+             self.frames_per_second,
+             self.ticks_per_frame) = decode_division(division)
 
             if self.debug:
                 _dbg('-> type={}, tracks={}, ticks_per_beat={}'.format(
@@ -392,7 +596,14 @@ class MidiFile:
             # Convert message time from absolute time
             # in ticks to relative time in seconds.
             if msg.time > 0:
-                delta = tick2second(msg.time, self.ticks_per_beat, tempo)
+                if self.frames_per_second:
+                    # SMPTE time code: the tick duration is fixed by the
+                    # frame rate and ticks per frame. The tempo map does
+                    # not affect it.
+                    delta = msg.time / (self.frames_per_second *
+                                        self.ticks_per_frame)
+                else:
+                    delta = tick2second(msg.time, self.ticks_per_beat, tempo)
             else:
                 delta = 0
 
@@ -461,9 +672,15 @@ class MidiFile:
 
     def _save(self, outfile):
         with meta_charset(self.charset):
-            header = struct.pack('>hhh', self.type,
+            if self.frames_per_second:
+                division = encode_division(self.frames_per_second,
+                                           self.ticks_per_frame)
+            else:
+                division = self.ticks_per_beat
+
+            header = struct.pack('>hhH', self.type,
                                  len(self.tracks),
-                                 self.ticks_per_beat)
+                                 division & 0xffff)
 
             write_chunk(outfile, b'MThd', header)
 

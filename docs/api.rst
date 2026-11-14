@@ -179,6 +179,11 @@ Standard MIDI Files
    :inherited-members:
    :undoc-members:
 
+.. autoclass:: SysexEscapeMessage
+   :members:
+   :inherited-members:
+   :undoc-members:
+
 .. autofunction:: tick2second
 
 .. autofunction:: second2tick

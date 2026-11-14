@@ -6,6 +6,7 @@ from typing import Optional
 
 from .messages import BaseMessage, Message
 from .midifiles import MetaMessage, UnknownMetaMessage
+from .midifiles.midifiles import SysexEscapeMessage
 
 
 class Frozen:
@@ -21,6 +22,10 @@ class FrozenMessage(Frozen, Message):
 
 
 class FrozenMetaMessage(Frozen, MetaMessage):
+    pass
+
+
+class FrozenSysexEscapeMessage(Frozen, SysexEscapeMessage):
     pass
 
 
@@ -53,6 +58,8 @@ def freeze_message(msg: Optional[BaseMessage]):
         return msg
     elif isinstance(msg, Message):
         class_ = FrozenMessage
+    elif isinstance(msg, SysexEscapeMessage):
+        class_ = FrozenSysexEscapeMessage
     elif isinstance(msg, UnknownMetaMessage):
         class_ = FrozenUnknownMetaMessage
     elif isinstance(msg, MetaMessage):
@@ -81,6 +88,8 @@ def thaw_message(msg: Optional[BaseMessage]):
         return msg.copy()
     elif isinstance(msg, FrozenMessage):
         class_ = Message
+    elif isinstance(msg, FrozenSysexEscapeMessage):
+        class_ = SysexEscapeMessage
     elif isinstance(msg, FrozenUnknownMetaMessage):
         class_ = UnknownMetaMessage
     elif isinstance(msg, FrozenMetaMessage):

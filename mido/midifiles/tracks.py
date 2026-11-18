@@ -72,6 +72,24 @@ def _to_abstime(messages, skip_checks=False):
         yield msg.copy(skip_checks=skip_checks, time=now)
 
 
+def _to_abstime_with_ports(track, skip_checks=False):
+    """Convert track messages to absolute time.
+
+    Yields (port, message) pairs where port is the midi_port in
+    effect for the message in its own track. midi_port meta messages
+    are not yielded, but reinserted by merge_tracks() where they are
+    needed.
+    """
+    now = 0
+    port = 0
+    for msg in track:
+        now += msg.time
+        if msg.type == 'midi_port':
+            port = msg.port
+        else:
+            yield port, msg.copy(skip_checks=skip_checks, time=now)
+
+
 def _to_reltime(messages, skip_checks=False):
     """Convert messages to relative time."""
     now = 0
@@ -109,19 +127,36 @@ def merge_tracks(tracks, skip_checks=False):
     The messages are returned in playback order with delta times
     as if they were all in one track.
 
+    midi_port meta messages are applied per track before merging and
+    reinserted into the merged track, so that every channel message
+    is still routed to the port declared by its own track instead of
+    being hijacked by port declarations from other tracks.
+
     Pass skip_checks=True to skip validation of messages before merging.
     This should ONLY be used when the messages in tracks have already
     been validated by mido.checks.
     """
     messages = []
     for track in tracks:
-        messages.extend(_to_abstime(track, skip_checks=skip_checks))
+        messages.extend(_to_abstime_with_ports(track, skip_checks=skip_checks))
 
-    messages.sort(key=lambda msg: msg.time)
+    messages.sort(key=lambda port_and_msg: port_and_msg[1].time)
+
+    # Reinsert midi_port meta messages so that each channel message is
+    # preceded by the port declaration of its own track. (The default
+    # port is 0, so files without midi_port messages are unaffected.)
+    port = 0
+    messages_with_ports = []
+    for msg_port, msg in messages:
+        if not msg.is_meta and hasattr(msg, 'channel') and msg_port != port:
+            port = msg_port
+            messages_with_ports.append(
+                MetaMessage('midi_port', port=port, time=msg.time))
+        messages_with_ports.append(msg)
 
     return MidiTrack(
         fix_end_of_track(
-            _to_reltime(messages, skip_checks=skip_checks),
+            _to_reltime(messages_with_ports, skip_checks=skip_checks),
             skip_checks=skip_checks,
         )
     )

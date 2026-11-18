@@ -235,7 +235,18 @@ def write_chunk(outfile, name, data):
     outfile.write(data)
 
 
-def write_track(outfile, track):
+def _check_message_length(length):
+    if length > MAX_MESSAGE_LENGTH:
+        raise ValueError('Message length {} exceeds maximum length {}'.format(
+            length, MAX_MESSAGE_LENGTH))
+
+
+def encode_track(track):
+    """Encode a track as the data portion of an MTrk chunk.
+
+    Raises ValueError if a message is too long to be read back
+    (longer than MAX_MESSAGE_LENGTH).
+    """
     data = bytearray()
 
     running_status_byte = None
@@ -251,11 +262,19 @@ def write_track(outfile, track):
         data.extend(encode_variable_int(msg.time))
 
         if msg.is_meta:
-            data.extend(msg.bytes())
+            msg_bytes = msg.bytes()
+            # The message data comes after the 0xff and type bytes and
+            # the variable length integer.
+            pos = 2
+            while msg_bytes[pos] & 0x80:
+                pos += 1
+            _check_message_length(len(msg_bytes) - pos - 1)
+            data.extend(msg_bytes)
             running_status_byte = None
         elif msg.type == 'sysex':
-            data.append(0xf0)
             # length (+ 1 for end byte (0xf7))
+            _check_message_length(len(msg.data) + 1)
+            data.append(0xf0)
             data.extend(encode_variable_int(len(msg.data) + 1))
             data.extend(msg.data)
             data.append(0xf7)
@@ -274,7 +293,11 @@ def write_track(outfile, track):
             else:
                 running_status_byte = None
 
-    write_chunk(outfile, b'MTrk', data)
+    return data
+
+
+def write_track(outfile, track):
+    write_chunk(outfile, b'MTrk', encode_track(track))
 
 
 def get_seconds_per_tick(tempo, ticks_per_beat):
@@ -305,7 +328,7 @@ class MidiFile:
         self.clip = clip
 
         self.tracks = []
-        self._merged_track = None
+        self._merged_track = None  # Deprecated. Kept for backwards compatibility.
 
         if type not in range(3):
             raise ValueError(
@@ -326,13 +349,16 @@ class MidiFile:
         if self.type == 2:
             raise TypeError("can't merge tracks in type 2 (asynchronous) file")
 
-        if self._merged_track is None:
-            self._merged_track = merge_tracks(self.tracks, skip_checks=True)
-        return self._merged_track
+        # The merged track is computed on every access so that
+        # changes made to the tracks are always reflected in
+        # iteration and length.
+        return merge_tracks(self.tracks, skip_checks=True)
 
     @merged_track.deleter
     def merged_track(self):
-        self._merged_track = None
+        # The merged track is no longer cached, so there is nothing
+        # to delete. The deleter is kept for backwards compatibility.
+        pass
 
     def add_track(self, name=None):
         """Add a new track to the file.
@@ -344,7 +370,6 @@ class MidiFile:
         if name is not None:
             track.name = name
         self.tracks.append(track)
-        del self.merged_track  # uncache merged track
         return track
 
     def _load(self, infile):
@@ -465,10 +490,15 @@ class MidiFile:
                                  len(self.tracks),
                                  self.ticks_per_beat)
 
+            # Encode all tracks before anything is written so that an
+            # error (for example a message that is too long to be read
+            # back) doesn't leave a half-written file behind.
+            tracks = [encode_track(track) for track in self.tracks]
+
             write_chunk(outfile, b'MThd', header)
 
-            for track in self.tracks:
-                write_track(outfile, track)
+            for track_data in tracks:
+                write_chunk(outfile, b'MTrk', track_data)
 
     def print_tracks(self, meta_only=False):
         """Prints out all messages in a .midi file.
